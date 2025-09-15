@@ -1,134 +1,197 @@
-# AtomMan Host Daemon
+# `screen.py` – AtomMan Serial Display Daemon
 
-A Python daemon that communicates with the AtomMan display over a serial port and provides system telemetry tiles: CPU, GPU, Memory, Disk, Date/Time/Week, Network, Volume, and Battery. It also includes an optional on-console dashboard.
+`screen.py` is a Python daemon that drives the **AtomMan USB serial display panel**, unlocking it after boot and continuously updating all tiles with system metrics (CPU, GPU, memory, disk, date, network, volume, battery, and fan speed).  
 
----
-
-## Protocol
-
-- **ENQ (dev→host)**: `AA 05 <SEQ_ASCII> CC 33 C3 3C`  
-- **REPLY (host→dev)**: `AA <TileID> 00 <SEQ_ASCII> {ASCII payload} CC 33 C3 3C`
-
-**Tile IDs / SEQ mapping:**
-
-| Tile | ID   | SEQ |
-|------|------|-----|
-| CPU  | 0x53 | '2' |
-| GPU  | 0x36 | '3' |
-| MEM  | 0x49 | '4' |
-| DISK | 0x4F | '5' |
-| DATE | 0x6B | '6' |
-| NET  | 0x27 | '7' |
-| VOL  | 0x10 | '9' |
-| BAT  | 0x1A | '2' (fallback) |
+The script is designed to run as a **systemd service** on Linux, with optional console dashboard output for debugging.
 
 ---
 
-## Telemetry Provided
+## ✨ Features
 
-- **CPU**: model, temp (°C), usage (%), and **frequency in kHz** (panel requires kHz).
-- **GPU**: name, temp (°C), utilization (%). Works with NVIDIA, AMD ROCm, and Intel iGPU (best effort).
-- **Memory**: used, available, total (GB), usage (%). Shows vendor if detected.
-- **Disk**: used, total (GB), usage (%). Shows NVMe model or lsblk vendor label.
-- **Date/Time/Week**:
-  - Payload form:
-    ```
-    {Date:YYYY/MM/DD;Time:HH:MM:SS;Week:N;Weather:;TemprLo:,TemprHi:,Zone:,Desc:}
-    ```
-  - **Week:N** is **0..6**, where **0 = Sunday** … **6 = Saturday**.
-  - If `Weather` is set: numeric code **1..40** maps to built-in screen icons.
-- **Network**: RX/TX throughput auto-scaled to `K/s`, `M/s`, or `G/s`.
-- **Fan speed (r/min)**:
-  1. **hwmon**: first non-zero `/sys/class/hwmon/hwmon*/fan*_input`.
-  2. **NVIDIA**: `nvidia-smi --query-gpu=fan.speed --format=csv,noheader,nounits` → % mapped to RPM using `--fan-max-rpm` (default 5000).
-  3. Fallback: `-1` (unknown).
-- **Volume**: system default sink volume (%).
-- **Battery**: capacity from `/sys/class/power_supply/BAT*`.
+- **Unlock & Retry Logic** – Robust startup handshake with retries until the panel activates.  
+- **Per-Tile Payloads** – Updates CPU, GPU, memory, disk, date, net, volume, battery.  
+- **Fan Speed**  
+  - Primary: Linux **hwmon** (`/sys/class/hwmon/*/fan*_input`)  
+  - Fallback: NVIDIA (`nvidia-smi --query-gpu=fan.speed`) → converts % to RPM  
+  - Final fallback: `-1` if no source found  
+- **CPU Frequency in kHz** (panel requires kHz, not MHz)  
+- **Date/Time/Week Tile**  
+  - Week uses `0..6` where `0=Sunday … 6=Saturday`  
+  - Full payload form includes placeholders for weather fields  
+  - Weather accepts numeric codes `1..40` → panel icons  
+- **Network Throughput Auto-Scaling**  
+  - Values shown in `K/s`, `M/s`, or `G/s` depending on rate  
+- **Optional Console Dashboard** (`--dashboard`) with ANSI colors  
+- **Configurable Start Delay** (ensures drivers/fans are ready before panel comms start)  
+- **Systemd Ready** – run as a background service with restart policy.  
 
 ---
 
-## Installation
+## 📦 Requirements
 
-# Clone
-git clone https://github.com/ramset/atomman.git
-cd atomman
+- Python 3.10+  
+- `pyserial`  
+- Linux with `/proc`, `/sys`, and `nvidia-smi` (optional for NVIDIA GPU metrics)  
 
-# System deps (Debian/Ubuntu examples)
-sudo apt-get update
-sudo apt-get install -y python3 python3-serial 
+Install dependencies:
 
-# NVIDIA optional
-# nvidia-smi comes with the NVIDIA driver; install from your distro or NVIDIA packages
+```bash
+sudo apt update
+sudo apt install python3 python3-pip dmidecode pciutils lshw
+pip install pyserial
+```
 
 ---
-## Permissions
 
-Allow your user to access the AtomMan serial port:
+## ⚡ Permissions
+
+The AtomMan display is exposed as a USB serial device under `/dev/serial/by-id/...`.  
+Grant your user access by adding them to the `dialout` group:
 
 ```bash
 sudo usermod -aG dialout <YOUR_USER>
 ```
 
-(Replace `<YOUR_USER>` with your Linux username. Log out and back in after running.)
+Log out and back in for this to take effect.
 
 ---
 
-## Usage
+## 🚀 Usage
 
-Run manually:
+Run directly:
 
 ```bash
 python3 screen.py --dashboard
 ```
 
-Key options:
+### Command-line Flags
 
-- `--dashboard` : show live console dashboard (off by default).
-- `--attempts N` : unlock retries (default 3).
-- `--window SEC` : seconds per unlock attempt.
-- `--start-delay SEC` : wait before serial open (default 3.0).
-- `--fan-prefer {auto|hwmon|nvidia}` : pick fan source (default auto).
-- `--fan-max-rpm N` : RPM to map NVIDIA % duty cycle (default 5000).
-- `--no-color` : disable ANSI color in dashboard.
+| Flag             | Default   | Description                                                                 |
+|------------------|-----------|-----------------------------------------------------------------------------|
+| `--attempts`     | `3`       | Unlock attempts before falling back into passive mode.                      |
+| `--window`       | `5.0`     | Seconds per unlock attempt window.                                          |
+| `--start-delay`  | `3.0`     | Seconds to sleep before opening serial port (driver warm-up).               |
+| `--dashboard`    | *off*     | Show live dashboard in console.                                             |
+| `--no-color`     | *off*     | Disable ANSI colors in dashboard.                                           |
+| `--fan-prefer`   | `auto`    | `auto` → hwmon → nvidia; or force one (`hwmon` or `nvidia`).                 |
+| `--fan-max-rpm`  | `5000`    | Used when NVIDIA reports % only; converted into RPM.                        |
 
-For all options:
+---
 
-```bash
-python3 screen.py --help
+## 🖥 Example Dashboard
+
+When `--dashboard` is enabled:
+
+```
+AtomMan — Active   Time: 2025-09-15 14:22:10
+----------------------------------------------------------------
+Processor type : AMD Ryzen 9 7940HS
+Processor temp : 62 °C
+CPU usage      : 27 %
+CPU freq       : 3,900,000 kHz
+
+GPU model      : NVIDIA RTX 4060
+GPU temp       : 70 °C
+GPU usage      : 43 %
+
+RAM (vendor)   : Samsung
+RAM used       : 9.5 GB
+RAM avail      : 22.3 GB
+RAM total      : 31.8 GB
+RAM usage      : 29 %
+
+Disk (label)   : Samsung SSD 980 PRO
+Disk used      : 222 GB
+Disk total     : 931 GB
+Disk usage     : 24 %
+
+Net iface      : eth0
+Net RX,TX      : 2.4M/s, 312K/s
+Fan speed      : 1570 r/min
+Volume         : 45 %
+Battery        : 97 %
+----------------------------------------------------------------
 ```
 
 ---
 
-## Service Setup
+## 🔌 Systemd Service Setup
 
-Create a systemd service file `/etc/systemd/system/atomman.service`:
+1. Copy `screen.py` into `/home/<YOUR_USER>/screen/screen.py`.  
+
+2. Create a service file:
 
 ```ini
+# /etc/systemd/system/atomman.service
 [Unit]
-Description=AtomMan Host Daemon
-After=multi-user.target
+Description=AtomMan Screen Daemon
+After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/<YOUR_USER>/atomman/screen.py --dashboard
-WorkingDirectory=/home/<YOUR_USER>/atomman
+ExecStart=/usr/bin/python3 /home/<YOUR_USER>/screen/screen.py --start-delay 5
+WorkingDirectory=/home/<YOUR_USER>/screen
 Restart=always
 User=<YOUR_USER>
+Group=dialout
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable + start:
+3. Reload systemd and enable the service:
 
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl enable atomman
 sudo systemctl start atomman
 ```
 
+4. Check logs:
+
+```bash
+journalctl -u atomman -f
+```
+
 ---
 
-## Notes
+## ⚙️ Internals
 
-- If fan reports `-1`, increase `--start-delay` to give GPU/driver time to initialize.
-- Date tile leaves weather fields blank by default; can be set to show icons.
-- Network throughput is shown as human-scaled units (K/M/G per second).
+### Protocol
+
+- **ENQ (device → host):**  
+  ```
+  AA 05 <SEQ_ASCII> CC 33 C3 3C
+  ```
+
+- **REPLY (host → device):**  
+  ```
+  AA <TileID> 00 <SEQ_ASCII> {ASCII payload} CC 33 C3 3C
+  ```
+
+### Tiles
+
+| Tile | ID  | Seq | Payload Example                                                                 |
+|------|-----|-----|---------------------------------------------------------------------------------|
+| CPU  | 0x53| '2' | `{CPU:AMD Ryzen 9;Tempr:62;Useage:27;Freq:3900000;Tempr1:62;}`                   |
+| GPU  | 0x36| '3' | `{GPU:NVIDIA RTX 4060;Tempr:70;Useage:43}`                                      |
+| MEM  | 0x49| '4' | `{Memory:Samsung;Used:9.5;Available:22.3;Total:31.8;Useage:29}`                  |
+| DISK | 0x4F| '5' | `{DiskName:Samsung SSD 980 PRO;Tempr:33;UsageSpace:222;AllSpace:931;Usage:24}`  |
+| DATE | 0x6B| '6' | `{Date:2025/09/15;Time:14:22:10;Week:1;Weather:;TemprLo:,TemprHi:,Zone:,Desc:}` |
+| NET  | 0x27| '7' | `{SPEED:1570;NETWORK:2.4M/s,312K/s}`                                            |
+| VOL  | 0x10| '9' | `{VOLUME:45}`                                                                   |
+| BAT  | 0x1A| '2' | `{Battery:97}`                                                                  |
+
+---
+
+## 🛠 Troubleshooting
+
+- **Fan shows `-1`** → Increase `--start-delay` so NVIDIA/hwmon drivers initialize.  
+- **No serial access** → Add your user to `dialout` (`sudo usermod -aG dialout <YOUR_USER>`).  
+- **Panel does not unlock** → Increase `--window` or `--attempts`.  
+- **Network RX/TX stuck** → Ensure interface is up (`ip link show`).  
+
+---
+
+## 📜 License
+
+MIT License — use freely for personal or commercial projects.
