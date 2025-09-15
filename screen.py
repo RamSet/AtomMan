@@ -3,44 +3,26 @@
 # ENQ (dev→host):   AA 05 <SEQ_ASCII> CC 33 C3 3C
 # REPLY (host→dev): AA <TileID> 00 <SEQ_ASCII> {ASCII payload} CC 33 C3 3C
 #
-# Per-tile SEQs:
-#   CPU  (0x53) → '2'
-#   GPU  (0x36) → '3'
-#   MEM  (0x49) → '4'
-#   DISK (0x4F) → '5'
-#   DATE (0x6B) → '6'
-#   NET  (0x27) → '7'
-#   VOL  (0x10) → '9'
-#   BAT  (0x1A) → '2' (fallback)
-#
-# DATE tile payload note:
-#   The screen accepts a “full” payload:
+# DATE tile payload is ALWAYS full:
+#   With internet/API OK:
 #     {Date:YYYY/MM/DD;Time:HH:MM:SS;Week:N;Weather:X;TemprLo:L,TemprHi:H,Zone:Z,Desc:D}
-#   This program sends the full form but intentionally leaves Weather/TemprLo/TemprHi/Zone/Desc blank:
-#     {Date:...;Time:...;Week:N;Weather:;TemprLo:,TemprHi:,Zone:,Desc:}
-#   • Week:N is 0..6 for Sunday..Saturday  (Sunday=0).
-#   • Weather is a NUMERIC code selecting a baked-in icon on the panel:
-#       1..40  (1 = first icon, 40 = last icon). Leave blank to show none.
+#   Without internet / missing API key / API fail:
+#     {Date:YYYY/MM/DD;Time:HH:MM:SS;Week:N;Weather:;TemprLo:,TemprHi:,Zone:,Desc:}
 #
-# FAN speed logic (for NET tile's SPEED = r/min):
-#   1) Try Linux HWMON: first non-zero /sys/class/hwmon/hwmon*/fan*_input → RPM.
-#   2) Else try NVIDIA: `nvidia-smi --query-gpu=fan.speed --format=csv,noheader,nounits` → percentage.
-#      Convert % → RPM using a configurable maximum:
-#        RPM = round( (percent / 100.0) * FAN_MAX_RPM )
-#      Default FAN_MAX_RPM = 5000 (override with --fan-max-rpm or ATOMMAN_FAN_MAX_RPM).
-#   3) If no source found, return -1 (explicit “unknown” for the panel).
-#
-# Network rates (NET tile's NETWORK field):
-#   Auto-scales units based on magnitude:
-#     < 1024 KB/s  → "X.X K/s"
-#     < 1024 MB/s  → "X.X M/s"
-#     otherwise    → "X.X G/s"
-#
-# Service tip:
-#   If the fan shows -1 at boot, increase --start-delay to give drivers time to initialize.
+# Weather:N is mapped from OpenWeather condition id/icon.
 
-import os, sys, time, subprocess, re, glob, argparse
+import os, sys, time, subprocess, re, glob, argparse, json, socket, urllib.parse, urllib.request
 import serial
+
+# ===================== User Weather Settings (HARD-CODED) =====================
+# Leave OW_API_KEY empty to behave as "no internet": blanks + one-time console note.
+OW_API_KEY   = ""               # e.g. "abcdef123456..."
+OW_LOCATION  = "denver,us"      # city | "zip,country" (e.g. "80014,us") | "lat,lon" (e.g. "39.7392,-104.9903")
+OW_UNITS     = "metric"         # "metric" (°C) or "imperial" (°F)
+OW_LANG      = "en"             # language for Desc
+# Cache refresh cadence (seconds). Env override: ATOMMAN_WEATHER_REFRESH
+WEATHER_REFRESH_SECONDS = int(os.getenv("ATOMMAN_WEATHER_REFRESH", "600"))
+# ==============================================================================
 
 # -------- Config (env overrides) --------
 PORT    = os.getenv("ATOMMAN_PORT", "/dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00")
@@ -112,10 +94,6 @@ def cpu_usage_pct() -> int:
     di,dt=i2-i1, t2-t1
     return max(0,min(100,int(round(100*(1-(di/float(dt or 1)))))))
 def cpu_freq_khz() -> int:
-    """
-    Return *kHz* as required by the panel.
-    sysfs provides kHz already; lscpu fallback (MHz) converted → kHz.
-    """
     for p in ("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
               "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq"):
         s=_read(p).strip()
@@ -135,10 +113,6 @@ def cpu_temp_c() -> int:
 
 # -------- FAN (RPM) --------
 def _fan_rpm_from_hwmon() -> int | None:
-    """
-    Scan hwmon for real RPM. Return first nonzero RPM found, or the maximum
-    nonzero if multiple present. None if no fan files exist.
-    """
     best = None
     for hm in glob.glob("/sys/class/hwmon/hwmon*"):
         for fan in glob.glob(os.path.join(hm, "fan*_input")):
@@ -149,32 +123,20 @@ def _fan_rpm_from_hwmon() -> int | None:
             except Exception:
                 pass
     return best
-
 def _fan_rpm_from_nvidia(max_rpm: int) -> int | None:
-    """
-    Use NVIDIA fan duty (%) and map to RPM via max_rpm.
-    Returns None if nvidia-smi not present or no value.
-    """
     out = _run(["nvidia-smi","--query-gpu=fan.speed","--format=csv,noheader,nounits"])
     if not out:
         return None
     try:
-        # First GPU line
         line = out.splitlines()[0].strip()
         if not line:
             return None
         percent = float(line)
-        # Note: 0% is a valid 0 RPM reading
         rpm = int(round((percent/100.0)*max(1, int(max_rpm))))
         return rpm
     except Exception:
         return None
-
 def fan_rpm(prefer: str, max_rpm: int) -> int:
-    """
-    prefer: 'auto' | 'hwmon' | 'nvidia'
-    Returns RPM if found (>=0). If no source available → -1.
-    """
     prefer = (prefer or "auto").lower()
     if prefer == "hwmon":
         v = _fan_rpm_from_hwmon()
@@ -186,7 +148,6 @@ def fan_rpm(prefer: str, max_rpm: int) -> int:
         if v is not None: return v
         v = _fan_rpm_from_hwmon()
         return v if v is not None else -1
-    # auto
     v = _fan_rpm_from_hwmon()
     if v is not None: return v
     v = _fan_rpm_from_nvidia(max_rpm)
@@ -199,7 +160,6 @@ def clean_gpu_name(name: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s or "GPU"
 def gpu_info():
-    # NVIDIA
     out = _run(["nvidia-smi","--query-gpu=name,temperature.gpu,utilization.gpu","--format=csv,noheader,nounits"])
     if out:
         try:
@@ -207,7 +167,6 @@ def gpu_info():
             return clean_gpu_name(name), int(temp), int(util)
         except Exception:
             pass
-    # AMD ROCm
     out = _run(["rocm-smi","--showtemp","--showuse"])
     if out:
         tm = re.search(r"(\d+(\.\d+)?)\s*c", out, re.I)
@@ -217,7 +176,6 @@ def gpu_info():
         nm = re.search(r"GPU\[\d+\].*?\s(.*?)\s{2,}", out)
         name = nm.group(1).strip() if nm else "AMD Radeon"
         return clean_gpu_name(name), temp, util
-    # Intel iGPU (best-effort)
     name = ""
     for path in ("/sys/class/drm/card0/device/product_name",
                  "/sys/class/drm/card0/device/name"):
@@ -403,7 +361,6 @@ class NetMeter:
                 self.iface = new
                 self._prime()
     def rates_ks(self):
-        """Return RX,TX in *KB/s* as floats (kiloBYTES per second)."""
         self.maybe_repick()
         if not self.iface:
             return None, None
@@ -418,10 +375,10 @@ class NetMeter:
         rxk = max(0.0, rxk); txk = max(0.0, txk)
         return rxk, txk
 _nm = NetMeter()
+_last_net = {"rxk": None, "txk": None, "rpm": None}
 
 # -------- Helpers --------
 def _fmt_rate(rate_kbs: float) -> str:
-    """Format RX/TX rate with auto unit scaling (K/M/G per second)."""
     if rate_kbs is None:
         return "N/A"
     if rate_kbs < 1024.0:
@@ -432,15 +389,168 @@ def _fmt_rate(rate_kbs: float) -> str:
     gbps = mbps / 1024.0
     return f"{gbps:.1f} G/s"
 
+# ===================== OpenWeather integration (cached) =====================
+# Weather cache: refresh at most every WEATHER_REFRESH_SECONDS
+_weather_cache = {
+    "ts": 0.0,          # last successful fetch time
+    "data": None,       # dict or None
+    "warned_no_key": False,
+}
+
+def _internet_ok(host="8.8.8.8", port=53, timeout=1.5) -> bool:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(timeout)
+        sock.connect((host, port)); sock.close()
+        return True
+    except Exception:
+        return False
+
+def _http_get_json(url: str, timeout: float = 7.0) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "AtomMan-Echo/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", errors="replace"))
+
+def _parse_location_ow(loc: str, key: str):
+    """Return (lat, lon, zone) or None."""
+    s = (loc or "").strip()
+    if not s:
+        return None
+    # Lat,lon
+    if "," in s:
+        a, b = [x.strip() for x in s.split(",", 1)]
+        try:
+            la, lo = float(a), float(b)
+            return la, lo, f"{la:.4f},{lo:.4f}"
+        except ValueError:
+            pass
+    # ZIP (requires country with OWM zip endpoint)
+    if s.replace("-", "").replace(" ", "").isdigit() or ("," in s and s.split(",")[0].strip().isdigit()):
+        if "," in s:
+            q = urllib.parse.quote(s)
+            try:
+                j = _http_get_json(f"https://api.openweathermap.org/geo/1.0/zip?zip={q}&appid={key}")
+                return float(j["lat"]), float(j["lon"]), f'{j.get("name","ZIP")}'
+            except Exception:
+                pass
+    # City,Country
+    q = urllib.parse.quote(s)
+    j = _http_get_json(f"https://api.openweathermap.org/geo/1.0/direct?q={q}&limit=1&appid={key}")
+    if isinstance(j, list) and j:
+        ent = j[0]
+        name = ent.get("name") or s
+        cc   = ent.get("country") or ""
+        st   = ent.get("state")
+        zone = name if not cc else f"{name},{cc}"
+        if st and st not in zone:
+            zone = f"{name}, {st}, {cc}" if cc else f"{name}, {st}"
+        return float(ent["lat"]), float(ent["lon"]), zone
+    return None
+
+def _map_openweather_id_to_weatherN(ow_id: int, icon: str) -> int:
+    day = icon.endswith("d") if icon else True
+    if ow_id == 800:
+        return 1 if day else 3                     # clear day/night
+    if ow_id == 801:
+        return 5 if day else 6                     # few clouds
+    if ow_id == 802:
+        return 7 if day else 8                     # scattered/mostly cloudy
+    if ow_id in (803, 804):
+        return 9                                   # overcast
+    g = ow_id // 100
+    if g == 2:                                     # thunderstorm
+        if ow_id in (202, 212, 232): return 16     # storm (strong)
+        return 11                                   # thundershower
+    if g == 3: return 13                            # drizzle → light rain
+    if g == 5:
+        if ow_id == 511: return 19                  # freezing rain
+        if ow_id in (520,521,522,531): return 10    # showers
+        if ow_id in (500,501): return 13 if ow_id==500 else 14
+        if ow_id in (502,503,504): return 15        # heavy rain
+        return 14
+    if g == 6:
+        if ow_id in (611,612,615,616): return 20    # sleet / wintry mix
+        if ow_id == 600: return 22                  # light snow
+        if ow_id == 601: return 23                  # moderate snow
+        if ow_id in (602,621,622): return 24        # heavy/snow showers
+        if ow_id == 620: return 21                  # flurry
+        return 22
+    if g == 7:
+        if ow_id in (701,741): return 30            # mist/fog
+        if ow_id in (711,721): return 31            # smoke/haze
+        if ow_id in (731,751): return 27            # sand
+        if ow_id in (761,762): return 26            # dust/ash
+        if ow_id == 771: return 33                   # squalls/blustery
+        if ow_id == 781: return 36                   # tornado
+        return 31
+    return 99
+
+def _fetch_openweather(lat: float, lon: float, key: str) -> dict:
+    qs = urllib.parse.urlencode({
+        "lat": f"{lat:.6f}",
+        "lon": f"{lon:.6f}",
+        "units": OW_UNITS,
+        "lang": OW_LANG,
+        "exclude": "minutely,hourly,alerts",
+        "appid": key,
+    })
+    return _http_get_json(f"https://api.openweathermap.org/data/3.0/onecall?{qs}")
+
+def _weather_fetch_now() -> dict | None:
+    """Return dict {weatherN, lo, hi, zone, desc} or None on any failure/disabled."""
+    key = (OW_API_KEY or "").strip()
+    if not key:
+        if not _weather_cache["warned_no_key"]:
+            print("[Weather] No OpenWeather API key set — DATE payload will carry blank weather fields.")
+            _weather_cache["warned_no_key"] = True
+        return None
+    if not _internet_ok():
+        return None
+    try:
+        loc = _parse_location_ow(OW_LOCATION, key)
+        if not loc:
+            return None
+        lat, lon, zone = loc
+        j = _fetch_openweather(lat, lon, key)
+        if not j or "current" not in j or "daily" not in j or not j["daily"]:
+            return None
+        cur = j["current"]; d0 = j["daily"][0]
+        w = cur.get("weather", [{}])[0]
+        owid = int(w.get("id", 0) or 0)
+        icon = str(w.get("icon", "") or "")
+        desc = str(w.get("description", "") or "")
+        weatherN = _map_openweather_id_to_weatherN(owid, icon)
+        temps = d0.get("temp", {})
+        lo = int(round(float(temps.get("min", cur.get("temp", 0)))))
+        hi = int(round(float(temps.get("max", cur.get("temp", 0)))))
+        zone_ascii = re.sub(r"[^\x20-\x7E]", "?", zone).replace(";", ",")
+        desc_ascii = re.sub(r"[^\x20-\x7E]", "?", desc).replace(";", ",")
+        return {"weatherN": weatherN, "lo": lo, "hi": hi, "zone": zone_ascii, "desc": desc_ascii}
+    except Exception:
+        return None
+
+def get_weather_cached() -> dict | None:
+    """Return cached weather or refresh if stale. Respects WEATHER_REFRESH_SECONDS."""
+    now = time.time()
+    if _weather_cache["data"] is not None and (now - _weather_cache["ts"] < WEATHER_REFRESH_SECONDS):
+        return _weather_cache["data"]
+    data = _weather_fetch_now()
+    # Cache the (possibly None) result to avoid spamming on repeated failures
+    _weather_cache["data"] = data
+    _weather_cache["ts"] = now
+    return data
+# =================== End OpenWeather integration ===================
+
 # -------- Tile payload generators --------
+def _week_num_from_localtime(t):
+    # Python: Monday=0..Sunday=6 → panel wants Sunday=0..Saturday=6
+    return (t.tm_wday + 1) % 7
+
 def p_cpu():
     t0=cpu_temp_c()
-    # NOTE: Freq must be kHz for the panel
     return f"{{CPU:{cpu_model()};Tempr:{t0};Useage:{cpu_usage_pct()};Freq:{cpu_freq_khz()};Tempr1:{t0};}}"
 
 def p_gpu():
     name,temp,util=gpu_info()
-    # GPU tile (no trailing ';' before '}')
     return f"{{GPU:{name};Tempr:{temp};Useage:{util}}}"
 
 def p_mem():
@@ -454,22 +564,34 @@ def p_dsk():
     return f"{{DiskName:{lab};Tempr:33;UsageSpace:{used};AllSpace:{total};Usage:{usage}}}"
 
 def p_date():
-    # Full payload form after Week:N, but leave the extra fields blank.
+    # ALWAYS full payload; weather fields may be blank
     t=time.localtime()
-    # Week must be 0..6 with Sunday=0 (Python's tm_wday is Mon=0..Sun=6)
-    week_num = (t.tm_wday + 1) % 7
-    return (
-        f"{{Date:{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d};"
-        f"Time:{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d};"
-        f"Week:{week_num};Weather:;TemprLo:,TemprHi:,Zone:,Desc:}}"
-    )
+    week_num = _week_num_from_localtime(t)
+    w = get_weather_cached()
+    if w:
+        return (
+            f"{{Date:{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d};"
+            f"Time:{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d};"
+            f"Week:{week_num};Weather:{w['weatherN']};"
+            f"TemprLo:{w['lo']},TemprHi:{w['hi']},"
+            f"Zone:{w['zone']},Desc:{w['desc']}}}"
+        )
+    else:
+        return (
+            f"{{Date:{t.tm_year:04d}/{t.tm_mon:02d}/{t.tm_mday:02d};"
+            f"Time:{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d};"
+            f"Week:{week_num};Weather:;TemprLo:,TemprHi:,Zone:,Desc:}}"
+        )
 
 def p_net(fan_prefer: str, fan_max_rpm: int):
-    rxk, txk = _nm.rates_ks()
+    rxk, txk = _nm.rates_ks()                    # sample once per NET tile visit
     rpm = fan_rpm(fan_prefer, fan_max_rpm)
+
+    # cache for dashboard/update_latest
+    _last_net["rxk"], _last_net["txk"], _last_net["rpm"] = rxk, txk, rpm
+
     if rxk is None or txk is None:
         return f"{{SPEED:{rpm};NETWORK:N/A,N/A}}"
-    # SPEED is r/min (RPM); NETWORK shows auto-scaled text for each direction
     return f"{{SPEED:{rpm};NETWORK:{_fmt_rate(rxk)},{_fmt_rate(txk)}}}"
 
 def p_vol():
@@ -555,6 +677,21 @@ def render_dashboard(latest):
     print(f"Fan speed      : {str(latest.get('fan_rpm','-1'))} r/min")
     print(f"Volume         : {str(latest.get('volume','-1'))} %")
     print(f"Battery        : {str(latest.get('battery','177'))} %")
+    print()
+    # --- Weather block (from cache) ---
+    w = get_weather_cached()
+    if w:
+        print(colorize("Weather        : ONLINE", C.BG))
+        unit_label = "°C" if OW_UNITS == "metric" else "°F"
+        print(f"  Code         : {w['weatherN']} (mapped)")
+        print(f"  Lo/Hi        : {w['lo']}/{w['hi']} {unit_label}")
+        print(f"  Zone         : {w['zone']}")
+        print(f"  Desc         : {w['desc']}")
+        age = int(time.time() - _weather_cache['ts'])
+        print(f"  Age          : {age}s (refresh {WEATHER_REFRESH_SECONDS}s)")
+    else:
+        reason = "no API key" if not OW_API_KEY.strip() else "offline/unavailable"
+        print(colorize(f"Weather        : OFFLINE ({reason})", C.BY))
     print("-"*72)
     sys.stdout.flush()
 
@@ -582,11 +719,20 @@ def update_latest_from_payload(id_byte, latest, fan_prefer, fan_max_rpm):
             "disk_used": used, "disk_total": total, "disk_usage": usage
         })
     elif id_byte==NET:
-        rxk,txk=_nm.rates_ks()
+        rxk = _last_net.get("rxk")
+        txk = _last_net.get("txk")
+        rpm = _last_net.get("rpm")
+
+        # Fallback once if cache is empty
+        if rxk is None or txk is None or rpm is None:
+            rxk, txk = _nm.rates_ks()
+            rpm = fan_rpm(fan_prefer, fan_max_rpm)
+            _last_net["rxk"], _last_net["txk"], _last_net["rpm"] = rxk, txk, rpm
+
         latest.update({
-            "net_rx": rxk,                     # store RAW float (KB/s)
+            "net_rx": rxk,
             "net_tx": txk,
-            "fan_rpm": fan_rpm(fan_prefer, fan_max_rpm),
+            "fan_rpm": rpm,
             "iface": _nm.iface or "N/A"
         })
     elif id_byte==VOL:
@@ -602,6 +748,9 @@ def update_latest_from_payload(id_byte, latest, fan_prefer, fan_max_rpm):
                         pct=int(f.read().strip()); break
         except Exception: pass
         latest.update({"battery": pct if pct is not None else 177})
+    elif id_byte==DAT:
+        # Nudge the weather cache on DATE tile cycles (will only fetch if stale)
+        get_weather_cached()
 
 # -------- Activation + Retry + Main loop --------
 def is_ascii_seq(b): return (0x30<=b<=0x39) or (b==0x3C)
