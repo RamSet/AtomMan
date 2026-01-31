@@ -11,7 +11,7 @@
 #
 # Weather:N is mapped from OpenWeather condition id/icon.
 
-import os, sys, time, subprocess, re, glob, argparse, json, socket, urllib.parse, urllib.request
+import os, sys, time, subprocess, re, glob, argparse, json, socket, signal, urllib.parse, urllib.request
 import serial
 
 # ===================== User Weather Settings (HARD-CODED) =====================
@@ -36,8 +36,12 @@ UNLOCK_WINDOW    = float(os.getenv("ATOMMAN_UNLOCK_SECONDS", "5.0"))
 POST_WRITE_SLEEP = float(os.getenv("ATOMMAN_WRITE_SLEEP", "0.006"))
 
 # Fan controls default via env, can be overridden by CLI
+# Note: NVIDIA only reports fan speed as percentage (0-100%). We estimate RPM as:
+#   RPM = percentage × max_rpm / 100
+# Default 2000 RPM is typical for modern GPUs. Adjust --fan-max-rpm for your card.
+# hwmon sensors (if available) report actual RPM directly.
 ENV_FAN_PREFER   = os.getenv("ATOMMAN_FAN_PREFER", "auto").lower()   # auto|hwmon|nvidia
-ENV_FAN_MAX_RPM  = int(os.getenv("ATOMMAN_FAN_MAX_RPM", "5000"))
+ENV_FAN_MAX_RPM  = int(os.getenv("ATOMMAN_FAN_MAX_RPM", "2000"))
 
 # -------- ANSI colors (dashboard only) --------
 class C:
@@ -81,77 +85,249 @@ def _read(path: str) -> str:
         return ""
 
 # -------- CPU --------
+_cpu_model_cache = None
+
 def cpu_model() -> str:
+    global _cpu_model_cache
+    if _cpu_model_cache is not None:
+        return _cpu_model_cache
     for ln in _read("/proc/cpuinfo").splitlines():
-        if ln.startswith("model name"): return ln.split(":",1)[1].strip()
-    return "Linux CPU"
+        if ln.startswith("model name"):
+            _cpu_model_cache = ln.split(":",1)[1].strip()
+            return _cpu_model_cache
+    _cpu_model_cache = "Linux CPU"
+    return _cpu_model_cache
+
+# CPU usage cache: sample once per tile cycle, reuse for payload + dashboard
+_cpu_cache = {"usage": 0, "idle": 0, "total": 0, "ts": 0.0}
+
 def cpu_usage_pct() -> int:
-    def snap():
-        parts=_read("/proc/stat").splitlines()[0].split()[1:]
-        n=list(map(int,parts)); idle=n[3]+n[4]; total=sum(n)
-        return idle,total
-    i1,t1=snap(); time.sleep(0.08); i2,t2=snap()
-    di,dt=i2-i1, t2-t1
-    return max(0,min(100,int(round(100*(1-(di/float(dt or 1)))))))
+    """Return cached CPU usage if fresh (< 0.5s), else sample and cache."""
+    now = time.time()
+    if now - _cpu_cache["ts"] < 0.5:
+        return _cpu_cache["usage"]
+    # Take a snapshot
+    parts = _read("/proc/stat").splitlines()[0].split()[1:]
+    n = list(map(int, parts))
+    idle = n[3] + n[4]
+    total = sum(n)
+    # Calculate delta from previous snapshot
+    di = idle - _cpu_cache["idle"]
+    dt = total - _cpu_cache["total"]
+    if dt > 0 and _cpu_cache["ts"] > 0:
+        usage = max(0, min(100, int(round(100 * (1 - (di / float(dt)))))))
+    else:
+        usage = 0
+    # Update cache
+    _cpu_cache["idle"] = idle
+    _cpu_cache["total"] = total
+    _cpu_cache["usage"] = usage
+    _cpu_cache["ts"] = now
+    return usage
 def cpu_freq_khz() -> int:
-    for p in ("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
-              "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq"):
-        s=_read(p).strip()
-        if s.isdigit(): return max(0, int(s))  # already kHz
-    out=_run(["lscpu"])
-    m=re.search(r"CPU MHz:\s*([\d.]+)",out)
-    return int(float(m.group(1))*1000) if m else 0
+    """Return max frequency across all cores (handles hybrid P/E-core CPUs)."""
+    max_freq = 0
+    # Try reading from all cores via sysfs
+    for cpu_dir in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq"):
+        for suffix in ("scaling_cur_freq", "cpuinfo_cur_freq"):
+            p = os.path.join(cpu_dir, suffix)
+            s = _read(p).strip()
+            if s.isdigit():
+                max_freq = max(max_freq, int(s))
+                break
+    if max_freq > 0:
+        return max_freq
+    # Fallback: read from /proc/cpuinfo (also aggregates all cores)
+    for ln in _read("/proc/cpuinfo").splitlines():
+        if ln.startswith("cpu MHz"):
+            try:
+                mhz = float(ln.split(":", 1)[1].strip())
+                max_freq = max(max_freq, int(mhz * 1000))
+            except (ValueError, IndexError):
+                pass
+    if max_freq > 0:
+        return max_freq
+    # Last resort: lscpu
+    out = _run(["lscpu"])
+    m = re.search(r"CPU MHz:\s*([\d.]+)", out)
+    return int(float(m.group(1)) * 1000) if m else 0
 def cpu_temp_c() -> int:
+    """Return CPU package/core temperature, preferring coretemp/k10temp over generic."""
+    # First pass: look for known CPU hwmon drivers
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        name = _read(os.path.join(hw, "name")).strip().lower()
+        # coretemp (Intel), k10temp (AMD), zenpower (AMD), cpu_thermal (ARM)
+        if name in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"):
+            for n in range(8):
+                p = os.path.join(hw, f"temp{n}_input")
+                s = _read(p).strip()
+                if s.isdigit():
+                    v = int(s)
+                    return v // 1000 if v > 1000 else v
+    # Second pass: look for temp labeled as CPU/Package/Tctl
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         for n in range(8):
-            p=f"{hw}/temp{n}_input"
-            if os.path.exists(p):
-                try:
-                    v=int(open(p).read().strip()); return v//1000 if v>1000 else v
-                except Exception: pass
+            label_path = os.path.join(hw, f"temp{n}_label")
+            label = _read(label_path).strip().lower()
+            if any(k in label for k in ("package", "tctl", "tdie", "cpu", "core 0")):
+                p = os.path.join(hw, f"temp{n}_input")
+                s = _read(p).strip()
+                if s.isdigit():
+                    v = int(s)
+                    return v // 1000 if v > 1000 else v
+    # Fallback: first available temp
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        for n in range(8):
+            p = os.path.join(hw, f"temp{n}_input")
+            s = _read(p).strip()
+            if s.isdigit():
+                v = int(s)
+                return v // 1000 if v > 1000 else v
     return 0
 
-# -------- FAN (RPM) --------
-def _fan_rpm_from_hwmon() -> int | None:
-    best = None
-    for hm in glob.glob("/sys/class/hwmon/hwmon*"):
-        for fan in glob.glob(os.path.join(hm, "fan*_input")):
-            try:
-                v = int(open(fan).read().strip())
-                if v > 0:
-                    best = v if best is None else max(best, v)
-            except Exception:
-                pass
-    return best
-def _fan_rpm_from_nvidia(max_rpm: int) -> int | None:
-    out = _run(["nvidia-smi","--query-gpu=fan.speed","--format=csv,noheader,nounits"])
-    if not out:
-        return None
-    try:
-        line = out.splitlines()[0].strip()
-        if not line:
+# -------- FAN (RPM) with caching + smoothing --------
+class FanCache:
+    """Caches fan readings to avoid repeated syscalls/subprocess spawns."""
+    def __init__(self, cache_ttl: float = 2.0, smooth_window: int = 5):
+        self.cache_ttl = cache_ttl
+        self.smooth_window = smooth_window
+        # Cached hwmon path (None = not yet discovered, "" = no hwmon fans)
+        self._hwmon_path: str | None = None
+        # pynvml handle (None = not initialized, False = unavailable)
+        self._nvml_handle = None
+        self._nvml_checked = False
+        # Cached values
+        self._cached_rpm: int | None = None
+        self._cached_time: float = 0.0
+        self._cached_source: str = ""
+        # Smoothing buffer (rolling average)
+        self._history: list[int] = []
+
+    def _discover_hwmon_fan(self) -> str:
+        """Find first working hwmon fan path, cache it."""
+        for hm in glob.glob("/sys/class/hwmon/hwmon*"):
+            for fan in glob.glob(os.path.join(hm, "fan*_input")):
+                s = _read(fan).strip()
+                if s.isdigit() and int(s) > 0:
+                    return fan
+        return ""  # No fans found
+
+    def _read_hwmon(self) -> int | None:
+        """Read from cached hwmon path."""
+        if self._hwmon_path is None:
+            self._hwmon_path = self._discover_hwmon_fan()
+        if not self._hwmon_path:
             return None
-        percent = float(line)
-        rpm = int(round((percent/100.0)*max(1, int(max_rpm))))
-        return rpm
-    except Exception:
+        s = _read(self._hwmon_path).strip()
+        if s.isdigit():
+            v = int(s)
+            return v if v > 0 else None
         return None
+
+    def _init_nvml(self) -> bool:
+        """Try to initialize pynvml (much faster than nvidia-smi)."""
+        if self._nvml_checked:
+            return self._nvml_handle is not None
+        self._nvml_checked = True
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return True
+        except Exception:
+            self._nvml_handle = None
+            return False
+
+    def _read_nvml(self) -> int | None:
+        """Read fan speed via pynvml (returns percentage)."""
+        if not self._init_nvml():
+            return None
+        try:
+            import pynvml
+            percent = pynvml.nvmlDeviceGetFanSpeed(self._nvml_handle)
+            return percent  # Return as percentage, caller converts
+        except Exception:
+            return None
+
+    def _read_nvidia_smi(self) -> int | None:
+        """Fallback: read fan speed via nvidia-smi subprocess (returns percentage)."""
+        out = _run(["nvidia-smi", "--query-gpu=fan.speed", "--format=csv,noheader,nounits"])
+        if not out:
+            return None
+        try:
+            line = out.splitlines()[0].strip()
+            if line:
+                return int(float(line))
+        except Exception:
+            pass
+        return None
+
+    def _read_nvidia(self, max_rpm: int) -> int | None:
+        """Read NVIDIA GPU fan, prefer pynvml over nvidia-smi."""
+        percent = self._read_nvml()
+        if percent is None:
+            percent = self._read_nvidia_smi()
+        if percent is not None:
+            return int(round((percent / 100.0) * max(1, max_rpm)))
+        return None
+
+    def _smooth(self, rpm: int) -> int:
+        """Apply rolling average smoothing."""
+        self._history.append(rpm)
+        if len(self._history) > self.smooth_window:
+            self._history.pop(0)
+        return int(sum(self._history) / len(self._history))
+
+    def get_rpm(self, prefer: str, max_rpm: int) -> int:
+        """Get fan RPM with caching and smoothing."""
+        now = time.time()
+        # Return cached value if still valid
+        if self._cached_rpm is not None and (now - self._cached_time) < self.cache_ttl:
+            return self._cached_rpm
+
+        prefer = (prefer or "auto").lower()
+        rpm: int | None = None
+        source = ""
+
+        if prefer == "hwmon":
+            rpm = self._read_hwmon()
+            source = "hwmon"
+            if rpm is None:
+                rpm = self._read_nvidia(max_rpm)
+                source = "nvidia"
+        elif prefer == "nvidia":
+            rpm = self._read_nvidia(max_rpm)
+            source = "nvidia"
+            if rpm is None:
+                rpm = self._read_hwmon()
+                source = "hwmon"
+        else:  # auto
+            rpm = self._read_hwmon()
+            source = "hwmon"
+            if rpm is None:
+                rpm = self._read_nvidia(max_rpm)
+                source = "nvidia"
+
+        if rpm is None:
+            rpm = -1
+            source = "none"
+
+        # Apply smoothing (only for valid readings)
+        if rpm > 0:
+            rpm = self._smooth(rpm)
+
+        # Cache result
+        self._cached_rpm = rpm
+        self._cached_time = now
+        self._cached_source = source
+        return rpm
+
+# Global fan cache instance
+_fan_cache = FanCache(cache_ttl=2.0, smooth_window=5)
+
 def fan_rpm(prefer: str, max_rpm: int) -> int:
-    prefer = (prefer or "auto").lower()
-    if prefer == "hwmon":
-        v = _fan_rpm_from_hwmon()
-        if v is not None: return v
-        v = _fan_rpm_from_nvidia(max_rpm)
-        return v if v is not None else -1
-    if prefer == "nvidia":
-        v = _fan_rpm_from_nvidia(max_rpm)
-        if v is not None: return v
-        v = _fan_rpm_from_hwmon()
-        return v if v is not None else -1
-    v = _fan_rpm_from_hwmon()
-    if v is not None: return v
-    v = _fan_rpm_from_nvidia(max_rpm)
-    return v if v is not None else -1
+    """Get fan RPM (cached, smoothed). Uses GPU fan if no hwmon fans available."""
+    return _fan_cache.get_rpm(prefer, max_rpm)
 
 # -------- GPU (NVIDIA/AMD/Intel/fallback) --------
 def clean_gpu_name(name: str) -> str:
@@ -187,8 +363,10 @@ def gpu_info():
         if m: name = m.group(1)
     temp = 0
     for cand in glob.glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp*_input"):
-        try: temp = int(open(cand).read().strip())//1000; break
-        except Exception: pass
+        s = _read(cand).strip()
+        if s.isdigit():
+            temp = int(s) // 1000
+            break
     if name:
         return clean_gpu_name(name), temp, 0
     return "GPU", 0, 0
@@ -209,6 +387,52 @@ def disk_numbers():
     to_gb=lambda b: int(round(b/1024/1024/1024))
     usage=int(round(100.0*(used_b/float(tot_b or 1))))
     return (to_gb(used_b), to_gb(tot_b), usage)
+
+def disk_temp_c() -> int:
+    """Return disk temperature (NVMe, SATA SSD/HDD) in Celsius."""
+    # 1. Try NVMe hwmon (most reliable for NVMe drives)
+    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+        name = _read(os.path.join(hwmon, "name")).strip()
+        if name == "nvme":
+            for n in range(4):
+                p = os.path.join(hwmon, f"temp{n}_input")
+                s = _read(p).strip()
+                if s.isdigit():
+                    v = int(s)
+                    return v // 1000 if v > 1000 else v
+    # 2. Try NVMe directly via /sys/class/nvme
+    for nvme in glob.glob("/sys/class/nvme/nvme*"):
+        # Some kernels expose temp directly
+        for temp_file in ("temp1_input", "hwmon/hwmon*/temp1_input"):
+            for p in glob.glob(os.path.join(nvme, temp_file)):
+                s = _read(p).strip()
+                if s.isdigit():
+                    v = int(s)
+                    return v // 1000 if v > 1000 else v
+    # 3. Try drivetemp hwmon (for SATA drives with kernel 5.6+)
+    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+        name = _read(os.path.join(hwmon, "name")).strip()
+        if name == "drivetemp":
+            p = os.path.join(hwmon, "temp1_input")
+            s = _read(p).strip()
+            if s.isdigit():
+                v = int(s)
+                return v // 1000 if v > 1000 else v
+    # 4. Try smartctl for SATA/SAS drives (slower but works on older kernels)
+    out = _run(["smartctl", "-A", "/dev/sda"], timeout=2.0)
+    if out:
+        # Look for "Temperature_Celsius" or "Airflow_Temperature" or ID 194
+        for line in out.splitlines():
+            if "Temperature_Celsius" in line or "194 " in line:
+                parts = line.split()
+                for p in parts:
+                    if p.isdigit() and 10 <= int(p) <= 100:
+                        return int(p)
+    # 5. Try hddtemp if available
+    out = _run(["hddtemp", "-n", "/dev/sda"], timeout=2.0)
+    if out.strip().isdigit():
+        return int(out.strip())
+    return 0  # Unknown
 
 # ---- RAM & Disk vendor (cached) ----
 _cache={"ram":("",0.0),"disk":("",0.0)}
@@ -561,7 +785,8 @@ def p_mem():
 def p_dsk():
     used,total,usage=disk_numbers()
     lab=disk_label() or "Disk"
-    return f"{{DiskName:{lab};Tempr:33;UsageSpace:{used};AllSpace:{total};Usage:{usage}}}"
+    temp=disk_temp_c()
+    return f"{{DiskName:{lab};Tempr:{temp};UsageSpace:{used};AllSpace:{total};Usage:{usage}}}"
 
 def p_date():
     # ALWAYS full payload; weather fields may be blank
@@ -664,7 +889,9 @@ def render_dashboard(latest):
     print(f"RAM usage      : {muc(str(latest.get('mem_usage','?')) + ' %')}")
     print()
     duc = usage_color(latest.get('disk_usage','?'))
+    dtc = temp_color(latest.get('disk_temp','0'))
     print(f"Disk (label)   : {latest.get('disk_label','')}")
+    print(f"Disk temp      : {dtc(str(latest.get('disk_temp','0')) + ' °C')}")
     print(f"Disk used      : {str(latest.get('disk_used','?'))} GB")
     print(f"Disk total     : {str(latest.get('disk_total','?'))} GB")
     print(f"Disk usage     : {duc(str(latest.get('disk_usage','?')) + ' %')}")
@@ -716,6 +943,7 @@ def update_latest_from_payload(id_byte, latest, fan_prefer, fan_max_rpm):
         used,total,usage=disk_numbers()
         latest.update({
             "disk_label": disk_label() or "Disk",
+            "disk_temp": disk_temp_c(),
             "disk_used": used, "disk_total": total, "disk_usage": usage
         })
     elif id_byte==NET:
@@ -782,7 +1010,7 @@ def unlock_attempt(ser, attempt_idx, latest, unlock_window, fan_prefer, fan_max_
     return activated
 
 def main():
-    global NOCOLOR
+    global NOCOLOR, _shutdown_requested
     ap=argparse.ArgumentParser(
         description="AtomMan daemon (tiles + optional dashboard)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -795,7 +1023,7 @@ def main():
     ap.add_argument("--fan-prefer", choices=["auto","hwmon","nvidia"], default=ENV_FAN_PREFER,
                     help="Preferred fan source (auto tries hwmon then NVIDIA)")
     ap.add_argument("--fan-max-rpm", type=int, default=ENV_FAN_MAX_RPM,
-                    help="Used only when NVIDIA reports percent; RPM = % * this / 100")
+                    help="Used only when NVIDIA reports percent; RPM = %% * this / 100")
     args=ap.parse_args()
     NOCOLOR = args.no_color
 
@@ -830,7 +1058,7 @@ def main():
     ]
     idx=0
     last_render=0.0
-    while True:
+    while not _shutdown_requested:
         enq3=read_enq(ser)
         if enq3 is None:
             if args.dashboard and (time.time()-last_render>1.0):
@@ -854,8 +1082,24 @@ def main():
 
         idx = (idx + 1) % 1_000_000
 
+    # Clean shutdown
+    print("[AtomMan] Shutting down.")
+    ser.close()
+
+_shutdown_requested = False
+
+def _signal_handler(signum, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    print(f"\n[AtomMan] Received signal {signum}, shutting down...")
+
 if __name__=="__main__":
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
     try:
         main()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"[AtomMan] Fatal error: {e}")
+        sys.exit(1)
