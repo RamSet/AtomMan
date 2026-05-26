@@ -195,31 +195,34 @@ Age            : 4s (refresh 600s)
 
 ## OpenWeather → Panel Icon Mapping
 
-| OpenWeather condition | Example values                | Panel code |
-|------------------------|--------------------------------|------------|
-| Clear sky              | `clear sky`                   | 1          |
-| Few clouds             | `few clouds`                  | 2          |
-| Scattered clouds       | `scattered clouds`            | 3          |
-| Broken clouds          | `broken clouds`               | 4          |
-| Overcast clouds        | `overcast clouds`             | 5          |
-| Light rain             | `light rain`                  | 6          |
-| Moderate rain          | `moderate rain`               | 7          |
-| Heavy rain             | `heavy intensity rain`        | 8          |
-| Thunderstorm           | `thunderstorm`, `thunder`     | 9          |
-| Light snow             | `light snow`                  | 10         |
-| Snow                   | `snow`                        | 11         |
-| Heavy snow             | `heavy snow`                  | 12         |
-| Sleet                  | `sleet`                       | 13         |
-| Mist / Fog / Haze      | `mist`, `fog`, `haze`         | 14         |
-| Smoke / Dust / Sand    | `smoke`, `dust`, `sand`       | 15         |
-| Tornado                | `tornado`                     | 16         |
-| Drizzle                | `light intensity drizzle`     | 17         |
-| Shower rain            | `shower rain`                 | 18         |
-| Freezing rain          | `freezing rain`               | 19         |
-| Extreme (hail, etc.)   | `hail`, `extreme`             | 20         |
-| …                      | (extend mapping as needed)    | 21–40      |
+The actual mapping lives in `_map_openweather_id_to_weatherN()` in `screen.py`. Codes are chosen to match icons baked into the panel firmware:
 
-(Only codes 1–40 are valid; unmapped conditions can be assigned arbitrarily within this range.)
+| OpenWeather condition (id)              | Panel code |
+|------------------------------------------|------------|
+| Clear sky (800) — day / night            | 1 / 3      |
+| Few clouds (801) — day / night           | 5 / 6      |
+| Scattered clouds (802) — day / night     | 7 / 8      |
+| Broken / overcast clouds (803, 804)      | 9          |
+| Thunderstorm (2xx)                       | 11         |
+| Severe thunderstorm (202, 212, 232)      | 16         |
+| Drizzle (3xx)                            | 13         |
+| Light rain (500)                         | 13         |
+| Moderate rain (501)                      | 14         |
+| Heavy rain (502, 503, 504)               | 15         |
+| Freezing rain (511)                      | 19         |
+| Shower rain (520, 521, 522, 531)         | 10         |
+| Light snow (600)                         | 22         |
+| Moderate snow (601)                      | 23         |
+| Heavy / snow showers (602, 621, 622)     | 24         |
+| Snow flurry (620)                        | 21         |
+| Sleet / wintry mix (611, 612, 615, 616)  | 20         |
+| Mist / fog (701, 741)                    | 30         |
+| Smoke / haze (711, 721)                  | 31         |
+| Sand (731, 751)                          | 27         |
+| Dust / volcanic ash (761, 762)           | 26         |
+| Squalls (771)                            | 33         |
+| Tornado (781)                            | 36         |
+| Unmapped                                 | 99         |
 
 ---
 
@@ -325,7 +328,7 @@ journalctl -u atomman -f
 |------|-----|-----|---------------------------------------------------------------------------------|
 | CPU  | 0x53| '2' | `{CPU:AMD Ryzen 9;Tempr:62;Useage:27;Freq:3900000;Tempr1:62;}`                   |
 | GPU  | 0x36| '3' | `{GPU:NVIDIA RTX 4060;Tempr:70;Useage:43}`                                      |
-| MEM  | 0x49| '4' | `{Memory:Samsung;Used:9.5;Available:22.3;Total:31.8;Useage:29}`                  |
+| MEM  | 0x49| '4' | `{Memory:Samsung;Used:9.5;Available:22.3;Total:31.8;Useage:29}` (vendor or `Memory` if unknown) |
 | DISK | 0x4F| '5' | `{DiskName:Samsung SSD 980 PRO;Tempr:42;UsageSpace:222;AllSpace:931;Usage:24}`  |
 | DATE | 0x6B| '6' | `{Date:2025/09/15;Time:14:22:10;Week:1;Weather:;TemprLo:,TemprHi:,Zone:,Desc:}` |
 | NET  | 0x27| '7' | `{SPEED:1570;NETWORK:2.4M/s,312K/s}`                                            |

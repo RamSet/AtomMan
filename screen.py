@@ -26,7 +26,7 @@ WEATHER_REFRESH_SECONDS = int(os.getenv("ATOMMAN_WEATHER_REFRESH", "600"))
 
 # -------- Config (env overrides) --------
 PORT    = os.getenv("ATOMMAN_PORT", "/dev/serial/by-id/usb-Synwit_USB_Virtual_COM-if00")
-BAUD    = int(os.getenv("ATOMMAN_BAUD", "115120").replace("115120","115200"))  # guard typo → 115200
+BAUD    = int(os.getenv("ATOMMAN_BAUD", "115200"))
 RTSCTS  = os.getenv("ATOMMAN_RTSCTS", "false").lower() in ("1","true","yes","on")
 DSRDTR  = os.getenv("ATOMMAN_DSRDTR", "true").lower()  in ("1","true","yes","on")
 TRAILER = b"\xCC\x33\xC3\x3C"
@@ -151,39 +151,41 @@ def cpu_freq_khz() -> int:
     out = _run(["lscpu"])
     m = re.search(r"CPU MHz:\s*([\d.]+)", out)
     return int(float(m.group(1)) * 1000) if m else 0
-def cpu_temp_c() -> int:
-    """Return CPU package/core temperature, preferring coretemp/k10temp over generic."""
-    # First pass: look for known CPU hwmon drivers
+_cpu_temp_path: str | None = None
+
+def _find_cpu_temp_path() -> str:
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         name = _read(os.path.join(hw, "name")).strip().lower()
-        # coretemp (Intel), k10temp (AMD), zenpower (AMD), cpu_thermal (ARM)
         if name in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"):
             for n in range(8):
                 p = os.path.join(hw, f"temp{n}_input")
-                s = _read(p).strip()
-                if s.isdigit():
-                    v = int(s)
-                    return v // 1000 if v > 1000 else v
-    # Second pass: look for temp labeled as CPU/Package/Tctl
+                if _read(p).strip().isdigit():
+                    return p
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         for n in range(8):
-            label_path = os.path.join(hw, f"temp{n}_label")
-            label = _read(label_path).strip().lower()
+            label = _read(os.path.join(hw, f"temp{n}_label")).strip().lower()
             if any(k in label for k in ("package", "tctl", "tdie", "cpu", "core 0")):
                 p = os.path.join(hw, f"temp{n}_input")
-                s = _read(p).strip()
-                if s.isdigit():
-                    v = int(s)
-                    return v // 1000 if v > 1000 else v
-    # Fallback: first available temp
+                if _read(p).strip().isdigit():
+                    return p
     for hw in glob.glob("/sys/class/hwmon/hwmon*"):
         for n in range(8):
             p = os.path.join(hw, f"temp{n}_input")
-            s = _read(p).strip()
-            if s.isdigit():
-                v = int(s)
-                return v // 1000 if v > 1000 else v
-    return 0
+            if _read(p).strip().isdigit():
+                return p
+    return ""
+
+def cpu_temp_c() -> int:
+    global _cpu_temp_path
+    if _cpu_temp_path is None:
+        _cpu_temp_path = _find_cpu_temp_path()
+    if not _cpu_temp_path:
+        return 0
+    s = _read(_cpu_temp_path).strip()
+    if not s.isdigit():
+        return 0
+    v = int(s)
+    return v // 1000 if v > 1000 else v
 
 # -------- FAN (RPM) with caching + smoothing --------
 class FanCache:
@@ -335,7 +337,18 @@ def clean_gpu_name(name: str) -> str:
     s = re.sub(r"\(R\)|\(TM\)|NVIDIA Corporation|Advanced Micro Devices,? Inc\.?|Intel\(R\)\s*", "", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip()
     return s or "GPU"
+_gpu_cache = {"data": None, "ts": 0.0}
+
 def gpu_info():
+    now = time.time()
+    if _gpu_cache["data"] is not None and now - _gpu_cache["ts"] < 2.0:
+        return _gpu_cache["data"]
+    data = _gpu_info_uncached()
+    _gpu_cache["data"] = data
+    _gpu_cache["ts"] = now
+    return data
+
+def _gpu_info_uncached():
     out = _run(["nvidia-smi","--query-gpu=name,temperature.gpu,utilization.gpu","--format=csv,noheader,nounits"])
     if out:
         try:
@@ -388,51 +401,53 @@ def disk_numbers():
     usage=int(round(100.0*(used_b/float(tot_b or 1))))
     return (to_gb(used_b), to_gb(tot_b), usage)
 
-def disk_temp_c() -> int:
-    """Return disk temperature (NVMe, SATA SSD/HDD) in Celsius."""
-    # 1. Try NVMe hwmon (most reliable for NVMe drives)
+_disk_temp_src: tuple[str, str] | None = None  # (kind, path_or_dev)
+
+def _find_disk_temp_src() -> tuple[str, str]:
     for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
-        name = _read(os.path.join(hwmon, "name")).strip()
-        if name == "nvme":
+        if _read(os.path.join(hwmon, "name")).strip() == "nvme":
             for n in range(4):
                 p = os.path.join(hwmon, f"temp{n}_input")
-                s = _read(p).strip()
-                if s.isdigit():
-                    v = int(s)
-                    return v // 1000 if v > 1000 else v
-    # 2. Try NVMe directly via /sys/class/nvme
+                if _read(p).strip().isdigit():
+                    return ("sysfs", p)
     for nvme in glob.glob("/sys/class/nvme/nvme*"):
-        # Some kernels expose temp directly
         for temp_file in ("temp1_input", "hwmon/hwmon*/temp1_input"):
             for p in glob.glob(os.path.join(nvme, temp_file)):
-                s = _read(p).strip()
-                if s.isdigit():
-                    v = int(s)
-                    return v // 1000 if v > 1000 else v
-    # 3. Try drivetemp hwmon (for SATA drives with kernel 5.6+)
+                if _read(p).strip().isdigit():
+                    return ("sysfs", p)
     for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
-        name = _read(os.path.join(hwmon, "name")).strip()
-        if name == "drivetemp":
+        if _read(os.path.join(hwmon, "name")).strip() == "drivetemp":
             p = os.path.join(hwmon, "temp1_input")
-            s = _read(p).strip()
-            if s.isdigit():
-                v = int(s)
-                return v // 1000 if v > 1000 else v
-    # 4. Try smartctl for SATA/SAS drives (slower but works on older kernels)
-    out = _run(["smartctl", "-A", "/dev/sda"], timeout=2.0)
-    if out:
-        # Look for "Temperature_Celsius" or "Airflow_Temperature" or ID 194
+            if _read(p).strip().isdigit():
+                return ("sysfs", p)
+    if _run(["smartctl", "-A", "/dev/sda"], timeout=2.0):
+        return ("smartctl", "/dev/sda")
+    if _run(["hddtemp", "-n", "/dev/sda"], timeout=2.0).strip().isdigit():
+        return ("hddtemp", "/dev/sda")
+    return ("none", "")
+
+def disk_temp_c() -> int:
+    global _disk_temp_src
+    if _disk_temp_src is None:
+        _disk_temp_src = _find_disk_temp_src()
+    kind, target = _disk_temp_src
+    if kind == "sysfs":
+        s = _read(target).strip()
+        if s.isdigit():
+            v = int(s)
+            return v // 1000 if v > 1000 else v
+    elif kind == "smartctl":
+        out = _run(["smartctl", "-A", target], timeout=2.0)
         for line in out.splitlines():
             if "Temperature_Celsius" in line or "194 " in line:
-                parts = line.split()
-                for p in parts:
+                for p in line.split():
                     if p.isdigit() and 10 <= int(p) <= 100:
                         return int(p)
-    # 5. Try hddtemp if available
-    out = _run(["hddtemp", "-n", "/dev/sda"], timeout=2.0)
-    if out.strip().isdigit():
-        return int(out.strip())
-    return 0  # Unknown
+    elif kind == "hddtemp":
+        out = _run(["hddtemp", "-n", target], timeout=2.0).strip()
+        if out.isdigit():
+            return int(out)
+    return 0
 
 # ---- RAM & Disk vendor (cached) ----
 _cache={"ram":("",0.0),"disk":("",0.0)}
@@ -779,8 +794,8 @@ def p_gpu():
 
 def p_mem():
     used,avail,total,usage=mem_info()
-    manu=ram_label(); label=f"Memory ({manu})" if manu else "Memory"
-    return f"{{Memory:{label};Used:{used};Available:{avail};Total:{total};Useage:{usage}}}"
+    manu=ram_label() or "Memory"
+    return f"{{Memory:{manu};Used:{used};Available:{avail};Total:{total};Useage:{usage}}}"
 
 def p_dsk():
     used,total,usage=disk_numbers()
@@ -819,19 +834,31 @@ def p_net(fan_prefer: str, fan_max_rpm: int):
         return f"{{SPEED:{rpm};NETWORK:N/A,N/A}}"
     return f"{{SPEED:{rpm};NETWORK:{_fmt_rate(rxk)},{_fmt_rate(txk)}}}"
 
-def p_vol():
-    out=_run(["pactl","get-sink-volume","@DEFAULT_SINK@"], timeout=0.7)
-    m=re.search(r"(\d+)%",out); vol=int(m.group(1)) if m else -1
-    return f"{{VOLUME:{vol}}}"
+_last_vol_bat = {"volume": -1, "battery": 177}
 
-def p_bat():
+def _read_volume() -> int:
+    out=_run(["pactl","get-sink-volume","@DEFAULT_SINK@"], timeout=0.7)
+    m=re.search(r"(\d+)%",out)
+    return int(m.group(1)) if m else -1
+
+def _read_battery() -> int:
     try:
         for base in os.listdir("/sys/class/power_supply"):
             if base.startswith("BAT"):
                 with open(f"/sys/class/power_supply/{base}/capacity") as f:
-                    return f"{{Battery:{int(f.read().strip())}}}"
+                    return int(f.read().strip())
     except Exception: pass
-    return "{Battery:177}"
+    return 177  # sentinel: no battery present (desktop)
+
+def p_vol():
+    vol = _read_volume()
+    _last_vol_bat["volume"] = vol
+    return f"{{VOLUME:{vol}}}"
+
+def p_bat():
+    pct = _read_battery()
+    _last_vol_bat["battery"] = pct
+    return f"{{Battery:{pct}}}"
 
 # Tile IDs & rotations
 CPU, GPU, MEM, DSK, DAT, NET, VOL, BAT = 0x53,0x36,0x49,0x4F,0x6B,0x27,0x10,0x1A
@@ -964,18 +991,9 @@ def update_latest_from_payload(id_byte, latest, fan_prefer, fan_max_rpm):
             "iface": _nm.iface or "N/A"
         })
     elif id_byte==VOL:
-        out=_run(["pactl","get-sink-volume","@DEFAULT_SINK@"], timeout=0.7)
-        m=re.search(r"(\d+)%",out); vol=int(m.group(1)) if m else -1
-        latest.update({"volume": vol})
+        latest.update({"volume": _last_vol_bat["volume"]})
     elif id_byte==BAT:
-        pct=None
-        try:
-            for base in os.listdir("/sys/class/power_supply"):
-                if base.startswith("BAT"):
-                    with open(f"/sys/class/power_supply/{base}/capacity") as f:
-                        pct=int(f.read().strip()); break
-        except Exception: pass
-        latest.update({"battery": pct if pct is not None else 177})
+        latest.update({"battery": _last_vol_bat["battery"]})
     elif id_byte==DAT:
         # Nudge the weather cache on DATE tile cycles (will only fetch if stale)
         get_weather_cached()
