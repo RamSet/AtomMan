@@ -152,16 +152,18 @@ Adjust `--fan-max-rpm` to match your GPU's actual maximum fan speed for more acc
   ```
 - Because of this restriction, the Windows weather feed cannot be reused directly.
 
-### OpenWeather Integration
-- `screen.py` now supports **OpenWeather** as the weather source.
-- You must provide an OpenWeather API key (free accounts available).
-- Location can be specified as a city name or ZIP code.
-- The script queries OpenWeather every 10 minutes (default, adjustable).
-- On success, the following fields are extracted:
-  - **Weather code → panel icon number (1–40)**
-  - **Daily low/high temperature**
-  - **Condition description** (used in dashboard only)
-  - **Zone (city, country)** (used in dashboard only)
+### Weather Providers
+`screen.py` supports two weather sources and selects one automatically:
+
+- **OpenWeather** – used when an API key is set in `OW_API_KEY`. Uses the One Call 3.0 endpoint (free to start, but requires a card on file).
+- **Open-Meteo** – a free, **no-API-key** provider used automatically when no key is set *or* when an OpenWeather request fails. This means weather works out of the box with zero configuration.
+
+Location (`OW_LOCATION`) can be a city name, `zip,country`, or `lat,lon`, and applies to both providers. Weather refreshes every 10 minutes by default (adjustable via `ATOMMAN_WEATHER_REFRESH`).
+
+On success the following fields are extracted:
+- **Weather condition → panel icon number (1–40)**, with day/night icon variants
+- **Daily low/high temperature**
+- **Condition description** and **Zone (city, country)** (used in dashboard only)
 
 ### Panel Behavior
 - **Weather**: numeric code shows the corresponding icon (1=first icon, 40=last).
@@ -195,7 +197,7 @@ Age            : 4s (refresh 600s)
 
 ## OpenWeather → Panel Icon Mapping
 
-The actual mapping lives in `_map_openweather_id_to_weatherN()` in `screen.py`. Codes are chosen to match icons baked into the panel firmware:
+The actual mapping lives in `_map_openweather_id_to_weatherN()` in `screen.py`. Codes are chosen to match icons baked into the panel firmware. Open-Meteo uses WMO condition codes, mapped to the same panel codes by `_map_wmo_to_weatherN()`.
 
 | OpenWeather condition (id)              | Panel code |
 |------------------------------------------|------------|
@@ -343,7 +345,7 @@ journalctl -u atomman -f
 - **No serial access** → Add your user to `dialout` (`sudo usermod -aG dialout <YOUR_USER>`).
 - **Panel does not unlock** → Increase `--window` or `--attempts`.
 - **Network RX/TX stuck** → Ensure interface is up (`ip link show`).
-- **Weather blank** → Missing API key or internet access.
+- **Weather blank** → No internet access. An API key is no longer required — Open-Meteo is used automatically without one.
 - **Zone/Desc not showing** → Expected, panel ignores them.
 - **CPU temp shows wrong sensor** → The script prioritizes coretemp/k10temp; check `sensors` output.
 - **Disk temp shows 0** → Install `smartmontools` or enable `drivetemp` kernel module.
@@ -351,6 +353,12 @@ journalctl -u atomman -f
 ---
 
 ## Changelog
+
+### v1.2.0
+
+**Weather:**
+- Added **Open-Meteo** as a free, keyless weather provider. Weather now works with no API key: the script uses OpenWeather when a key is set and falls back to Open-Meteo when no key is set or an OpenWeather request fails.
+- Fixed night weather icons never appearing (the day/night flag was always read as daytime).
 
 ### v1.1.0
 
