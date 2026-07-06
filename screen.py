@@ -34,6 +34,9 @@ TRAILER = b"\xCC\x33\xC3\x3C"
 DEFAULT_WAIT_START = float(os.getenv("ATOMMAN_WAIT_START", "3.0"))
 UNLOCK_WINDOW    = float(os.getenv("ATOMMAN_UNLOCK_SECONDS", "5.0"))
 POST_WRITE_SLEEP = float(os.getenv("ATOMMAN_WRITE_SLEEP", "0.006"))
+# Steady-state watchdog: if no ENQ arrives for this many seconds, treat the
+# serial link as dead (e.g. after system sleep/wake) and reopen the port.
+LINK_TIMEOUT     = float(os.getenv("ATOMMAN_LINK_TIMEOUT", "15.0"))
 
 # Fan controls default via env, can be overridden by CLI
 # Note: NVIDIA only reports fan speed as percentage (0-100%). We estimate RPM as:
@@ -1136,6 +1139,43 @@ def unlock_attempt(ser, attempt_idx, latest, unlock_window, fan_prefer, fan_max_
         print(f"[Attempt {attempt_idx}] No activation within window.")
     return activated
 
+def reconnect_serial(old_ser, latest, args):
+    """Close a dead serial link and reopen it, re-running the unlock handshake.
+
+    Handles the post-sleep/wake case where the panel re-enumerates and the old
+    file descriptor goes stale. The /dev/serial/by-id path is stable across
+    re-enumeration, so reopening PORT reattaches to the new ttyACM. Blocks with
+    backoff until the port reopens or shutdown is requested.
+    """
+    try:
+        old_ser.close()
+    except Exception:
+        pass
+    backoff = 1.0
+    while not _shutdown_requested:
+        try:
+            ser = open_serial(min(args.start_delay, 2.0))
+        except Exception as e:
+            print(f"[Reconnect] Port not ready ({e}); retry in {backoff:.0f}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
+            continue
+        print(f"[Reconnect] Reopened {PORT}; re-running unlock.")
+        for i in range(1, args.attempts + 1):
+            try:
+                if unlock_attempt(ser, i, latest, args.window,
+                                  args.fan_prefer, args.fan_max_rpm, args.dashboard):
+                    break
+            except serial.SerialException as e:
+                print(f"[Reconnect] Serial error during unlock: {e}")
+                break
+            try:
+                ser.setDTR(False); time.sleep(0.05); ser.setDTR(True)
+            except Exception:
+                pass
+        return ser
+    return old_ser
+
 def main():
     global NOCOLOR, _shutdown_requested
     ap=argparse.ArgumentParser(
@@ -1185,19 +1225,41 @@ def main():
     ]
     idx=0
     last_render=0.0
+    last_enq=time.time()
     while not _shutdown_requested:
-        enq3=read_enq(ser)
+        try:
+            enq3=read_enq(ser)
+        except serial.SerialException as e:
+            print(f"[Link] Read error ({e}); reconnecting.")
+            ser = reconnect_serial(ser, latest, args)
+            last_enq = time.time()
+            continue
+
         if enq3 is None:
+            # Watchdog: a live panel sends ENQs several times/sec. Prolonged
+            # silence means the link died (e.g. after sleep/wake) — reopen it.
+            if time.time() - last_enq > LINK_TIMEOUT:
+                print(f"[Link] No ENQ for {LINK_TIMEOUT:.0f}s — reconnecting serial.")
+                ser = reconnect_serial(ser, latest, args)
+                last_enq = time.time()
             if args.dashboard and (time.time()-last_render>1.0):
                 render_dashboard(latest)
                 last_render=time.time()
             continue
 
+        last_enq = time.time()
+
         tile, maker = FULL_ROT[idx % len(FULL_ROT)]
         payload = maker()
         seq = seq_for(tile)
         frm = build_reply(tile, seq, payload)
-        ser.write(frm); ser.flush(); time.sleep(POST_WRITE_SLEEP)
+        try:
+            ser.write(frm); ser.flush(); time.sleep(POST_WRITE_SLEEP)
+        except serial.SerialException as e:
+            print(f"[Link] Write error ({e}); reconnecting.")
+            ser = reconnect_serial(ser, latest, args)
+            last_enq = time.time()
+            continue
 
         update_latest_from_payload(tile, latest, args.fan_prefer, args.fan_max_rpm)
 

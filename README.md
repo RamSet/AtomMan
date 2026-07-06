@@ -35,6 +35,7 @@ The script is designed to run as a **systemd service** on Linux, with optional c
 - **Optional Console Dashboard** (`--dashboard`) with ANSI colors
 - **Configurable Start Delay** (ensures drivers/fans are ready before panel comms start)
 - **Graceful Shutdown** – Handles SIGTERM and SIGINT for clean systemd stops
+- **Auto-Reconnect** – Detects a dead serial link (stale fd after sleep/wake, USB drop) and reopens the port + re-runs the unlock handshake in-process, no reboot needed
 - **Systemd Ready** – run as a background service with restart policy.
 
 ---
@@ -122,6 +123,7 @@ All flags can be set via environment variables:
 | `ATOMMAN_FAN_PREFER` | `auto` | Fan source preference |
 | `ATOMMAN_FAN_MAX_RPM` | `2000` | Max RPM for NVIDIA conversion |
 | `ATOMMAN_WEATHER_REFRESH` | `600` | Weather cache refresh (seconds) |
+| `ATOMMAN_LINK_TIMEOUT` | `15` | Seconds of ENQ silence before the link is treated as dead and the port reopened |
 
 ### Fan Speed Note
 
@@ -344,6 +346,7 @@ journalctl -u atomman -f
 - **Fan shows `-1`** → Increase `--start-delay` so NVIDIA/hwmon drivers initialize.
 - **No serial access** → Add your user to `dialout` (`sudo usermod -aG dialout <YOUR_USER>`).
 - **Panel does not unlock** → Increase `--window` or `--attempts`.
+- **Screen blank after sleep/wake** → Handled automatically: the daemon detects the dead link and reopens the port within a few seconds. If it persists, lower `ATOMMAN_LINK_TIMEOUT`. No reboot or manual USB reset required.
 - **Network RX/TX stuck** → Ensure interface is up (`ip link show`).
 - **Weather blank** → No internet access. An API key is no longer required — Open-Meteo is used automatically without one.
 - **Zone/Desc not showing** → Expected, panel ignores them.
@@ -355,6 +358,9 @@ journalctl -u atomman -f
 ## Changelog
 
 ### v1.2.0
+
+**Reliability:**
+- Added in-process **auto-reconnect**. If the serial link goes dead — a stale file descriptor after system sleep/wake, or a USB drop — the daemon reopens the port and re-runs the unlock handshake automatically, recovering in a few seconds instead of staying blank until a reboot.
 
 **Weather:**
 - Added **Open-Meteo** as a free, keyless weather provider. Weather now works with no API key: the script uses OpenWeather when a key is set and falls back to Open-Meteo when no key is set or an OpenWeather request fails.
