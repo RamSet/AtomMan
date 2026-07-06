@@ -734,16 +734,14 @@ def _fetch_openweather(lat: float, lon: float, key: str) -> dict:
     })
     return _http_get_json(f"https://api.openweathermap.org/data/3.0/onecall?{qs}")
 
-def _weather_fetch_now() -> dict | None:
-    """Return dict {weatherN, lo, hi, zone, desc} or None on any failure/disabled."""
-    key = (OW_API_KEY or "").strip()
-    if not key:
-        if not _weather_cache["warned_no_key"]:
-            print("[Weather] No OpenWeather API key set — DATE payload will carry blank weather fields.")
-            _weather_cache["warned_no_key"] = True
-        return None
-    if not _internet_ok():
-        return None
+def _mk_weather(weatherN: int, lo: int, hi: int, zone: str, desc: str) -> dict:
+    """Assemble the weather dict with ASCII-safe zone/desc for the serial protocol."""
+    zone_ascii = re.sub(r"[^\x20-\x7E]", "?", str(zone)).replace(";", ",")
+    desc_ascii = re.sub(r"[^\x20-\x7E]", "?", str(desc)).replace(";", ",")
+    return {"weatherN": weatherN, "lo": lo, "hi": hi, "zone": zone_ascii, "desc": desc_ascii}
+
+def _openweather_now(key: str) -> dict | None:
+    """Fetch via OpenWeather One Call 3.0 (paid tier). Returns None on any failure."""
     try:
         loc = _parse_location_ow(OW_LOCATION, key)
         if not loc:
@@ -761,11 +759,123 @@ def _weather_fetch_now() -> dict | None:
         temps = d0.get("temp", {})
         lo = int(round(float(temps.get("min", cur.get("temp", 0)))))
         hi = int(round(float(temps.get("max", cur.get("temp", 0)))))
-        zone_ascii = re.sub(r"[^\x20-\x7E]", "?", zone).replace(";", ",")
-        desc_ascii = re.sub(r"[^\x20-\x7E]", "?", desc).replace(";", ",")
-        return {"weatherN": weatherN, "lo": lo, "hi": hi, "zone": zone_ascii, "desc": desc_ascii}
+        return _mk_weather(weatherN, lo, hi, zone, desc)
     except Exception:
         return None
+
+# ---- Open-Meteo (keyless, free) fallback ----
+_OPENMETEO_DESC = {
+    0:"Clear sky", 1:"Mainly clear", 2:"Partly cloudy", 3:"Overcast",
+    45:"Fog", 48:"Rime fog", 51:"Light drizzle", 53:"Drizzle", 55:"Dense drizzle",
+    56:"Freezing drizzle", 57:"Freezing drizzle", 61:"Slight rain", 63:"Rain",
+    65:"Heavy rain", 66:"Freezing rain", 67:"Freezing rain", 71:"Slight snow",
+    73:"Snow", 75:"Heavy snow", 77:"Snow grains", 80:"Rain showers", 81:"Rain showers",
+    82:"Violent rain showers", 85:"Snow showers", 86:"Snow showers", 95:"Thunderstorm",
+    96:"Thunderstorm w/ hail", 99:"Thunderstorm w/ hail",
+}
+
+def _map_wmo_to_weatherN(code: int, is_day: bool = True) -> int:
+    """Map a WMO weather code (Open-Meteo) to an AtomMan weatherN display code."""
+    if code == 0: return 1 if is_day else 3     # clear
+    if code == 1: return 5 if is_day else 6     # mainly clear
+    if code == 2: return 7 if is_day else 8     # partly cloudy
+    if code == 3: return 9                      # overcast
+    if code in (45, 48): return 30              # fog
+    if code in (51, 53, 55): return 13          # drizzle → light rain
+    if code in (56, 57): return 19              # freezing drizzle
+    if code == 61: return 13                    # slight rain
+    if code == 63: return 14                    # moderate rain
+    if code == 65: return 15                    # heavy rain
+    if code in (66, 67): return 19              # freezing rain
+    if code == 71: return 22                    # slight snow
+    if code == 73: return 23                    # moderate snow
+    if code == 75: return 24                    # heavy snow
+    if code == 77: return 21                    # snow grains → flurry
+    if code in (80, 81): return 10              # rain showers
+    if code == 82: return 15                    # violent rain showers → heavy
+    if code in (85, 86): return 24              # snow showers
+    if code == 95: return 11                    # thunderstorm
+    if code in (96, 99): return 16              # thunderstorm w/ hail → strong storm
+    return 99
+
+def _parse_location_openmeteo(loc: str):
+    """Return (lat, lon, zone) using Open-Meteo geocoding (no key). None on failure."""
+    s = (loc or "").strip()
+    if not s:
+        return None
+    if "," in s:  # try lat,lon first
+        a, b = [x.strip() for x in s.split(",", 1)]
+        try:
+            la, lo = float(a), float(b)
+            return la, lo, f"{la:.4f},{lo:.4f}"
+        except ValueError:
+            pass
+    name = s.split(",")[0].strip()
+    cc = s.split(",", 1)[1].strip() if "," in s else ""
+    q = urllib.parse.urlencode({"name": name, "count": 1, "language": "en", "format": "json"})
+    try:
+        j = _http_get_json(f"https://geocoding-api.open-meteo.com/v1/search?{q}")
+    except Exception:
+        return None
+    results = j.get("results") if isinstance(j, dict) else None
+    if not results:
+        return None
+    r = results[0]
+    lat = float(r["latitude"]); lon = float(r["longitude"])
+    zname = r.get("name") or name
+    country = r.get("country_code") or cc
+    zone = f"{zname},{country}" if country else zname
+    return lat, lon, zone
+
+def _openmeteo_now() -> dict | None:
+    """Fetch via Open-Meteo (free, no API key). Returns None on any failure."""
+    try:
+        loc = _parse_location_openmeteo(OW_LOCATION)
+        if not loc:
+            return None
+        lat, lon, zone = loc
+        unit = "fahrenheit" if OW_UNITS == "imperial" else "celsius"
+        qs = urllib.parse.urlencode({
+            "latitude":         f"{lat:.6f}",
+            "longitude":        f"{lon:.6f}",
+            "current":          "temperature_2m,weather_code,is_day",
+            "daily":            "weather_code,temperature_2m_max,temperature_2m_min",
+            "timezone":         "auto",
+            "forecast_days":    1,
+            "temperature_unit": unit,
+        })
+        j = _http_get_json(f"https://api.open-meteo.com/v1/forecast?{qs}")
+        cur = j.get("current") if isinstance(j, dict) else None
+        daily = j.get("daily") if isinstance(j, dict) else None
+        if not cur or not daily:
+            return None
+        code = int(cur.get("weather_code", 0) or 0)
+        is_day = bool(int(cur.get("is_day", 1)))   # 1 = day, 0 = night (don't `or 1`)
+        lo = int(round(float((daily.get("temperature_2m_min") or [0])[0])))
+        hi = int(round(float((daily.get("temperature_2m_max") or [0])[0])))
+        weatherN = _map_wmo_to_weatherN(code, is_day)
+        return _mk_weather(weatherN, lo, hi, zone, _OPENMETEO_DESC.get(code, ""))
+    except Exception:
+        return None
+
+def _weather_fetch_now() -> dict | None:
+    """Return dict {weatherN, lo, hi, zone, desc} or None.
+
+    Uses OpenWeather when an API key is set (One Call 3.0, paid tier), and
+    falls back to keyless Open-Meteo when there is no key or OpenWeather fails.
+    """
+    if not _internet_ok():
+        return None
+    key = (OW_API_KEY or "").strip()
+    if key:
+        w = _openweather_now(key)
+        if w:
+            return w
+        # OpenWeather failed (e.g. a free key without One Call 3.0) — fall through.
+    elif not _weather_cache["warned_no_key"]:
+        print("[Weather] No OpenWeather key — using keyless Open-Meteo provider.")
+        _weather_cache["warned_no_key"] = True
+    return _openmeteo_now()
 
 def get_weather_cached() -> dict | None:
     """Return cached weather or refresh if stale. Respects WEATHER_REFRESH_SECONDS."""
@@ -944,8 +1054,7 @@ def render_dashboard(latest):
         age = int(time.time() - _weather_cache['ts'])
         print(f"  Age          : {age}s (refresh {WEATHER_REFRESH_SECONDS}s)")
     else:
-        reason = "no API key" if not OW_API_KEY.strip() else "offline/unavailable"
-        print(colorize(f"Weather        : OFFLINE ({reason})", C.BY))
+        print(colorize("Weather        : OFFLINE (offline/unavailable)", C.BY))
     print("-"*72)
     sys.stdout.flush()
 
